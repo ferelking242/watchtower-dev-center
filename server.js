@@ -4,16 +4,17 @@ import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
 import { loadAllExtensions, findExtension, invalidateCache } from './engine/indexer.js';
 import { runExtensionMethod, clearCodeCache } from './engine/runner.js';
+import { generateWithAI } from './engine/ai.js';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 5000;
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.use(express.static(resolve(__dir, 'public')));
 
-// ── List all JS extensions ───────────────────────────────────────────────────
+// ── Extensions ───────────────────────────────────────────────────────────────
 app.get('/api/extensions', async (req, res) => {
   try {
     const all = await loadAllExtensions();
@@ -23,8 +24,7 @@ app.get('/api/extensions', async (req, res) => {
     if (q) {
       const ql = q.toLowerCase();
       filtered = filtered.filter(e =>
-        e.name.toLowerCase().includes(ql) ||
-        (e.lang || '').toLowerCase().includes(ql)
+        e.name.toLowerCase().includes(ql) || (e.lang || '').toLowerCase().includes(ql)
       );
     }
     res.json({ count: filtered.length, extensions: filtered });
@@ -33,14 +33,12 @@ app.get('/api/extensions', async (req, res) => {
   }
 });
 
-// ── Reload extension cache ───────────────────────────────────────────────────
 app.post('/api/reload', (_req, res) => {
   invalidateCache();
   clearCodeCache();
   res.json({ ok: true });
 });
 
-// ── Helper: run method and respond ──────────────────────────────────────────
 async function runMethod(req, res, methodName, args) {
   const id = req.params.id;
   try {
@@ -54,42 +52,64 @@ async function runMethod(req, res, methodName, args) {
   }
 }
 
-// ── Popular ──────────────────────────────────────────────────────────────────
-app.get('/api/ext/:id/popular', async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  await runMethod(req, res, 'getPopular', [page]);
+app.get('/api/extensions/:id/popular',  (req, res) => runMethod(req, res, 'getPopular',  [parseInt(req.query.page) || 1]));
+app.get('/api/extensions/:id/latest',   (req, res) => runMethod(req, res, 'getLatest',   [parseInt(req.query.page) || 1]));
+app.get('/api/extensions/:id/search',   (req, res) => runMethod(req, res, 'search',       [req.query.q || '', parseInt(req.query.page) || 1, []]));
+app.get('/api/extensions/:id/detail',   (req, res) => runMethod(req, res, 'getDetail',    [req.query.url || '']));
+app.get('/api/extensions/:id/pagelist', (req, res) => runMethod(req, res, 'getPageList',  [req.query.url || '']));
+app.get('/api/extensions/:id/filters',  (req, res) => runMethod(req, res, 'getFilterList',[]));;
+
+// ── Plugins ───────────────────────────────────────────────────────────────────
+
+// Run a plugin method in the sandbox
+app.post('/api/plugin/run', async (req, res) => {
+  const { code, manifest, action, payload } = req.body || {};
+  if (!code) return res.status(400).json({ error: 'code required' });
+
+  try {
+    const { runPluginCode } = await import('./engine/runner.js');
+    const result = await runPluginCode(code, manifest || {}, action || 'load', payload || {});
+    res.json({ ok: true, result, logs: result?._logs || [] });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-// ── Latest ───────────────────────────────────────────────────────────────────
-app.get('/api/ext/:id/latest', async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  await runMethod(req, res, 'getLatestUpdates', [page]);
+// Publish a plugin to the watchtower-extensions repo
+app.post('/api/plugin/publish', async (req, res) => {
+  const GH_PAT = process.env.GH_PAT;
+  if (!GH_PAT) return res.status(503).json({ error: 'GH_PAT not configured' });
+
+  const { manifest, files } = req.body || {};
+  if (!manifest?.id) return res.status(400).json({ error: 'manifest.id required' });
+
+  const pluginId = manifest.id;
+  const OWNER = 'ferelking242';
+  const REPO  = 'watchtower-extensions';
+
+  try {
+    const { pushPluginFiles } = await import('./engine/publisher.js');
+    const result = await pushPluginFiles(GH_PAT, OWNER, REPO, pluginId, manifest, files);
+    res.json({ ok: true, commit: result.sha, url: `https://github.com/${OWNER}/${REPO}/tree/main/plugins/${pluginId}` });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-// ── Search ───────────────────────────────────────────────────────────────────
-app.get('/api/ext/:id/search', async (req, res) => {
-  const { q = '', page = 1 } = req.query;
-  await runMethod(req, res, 'search', [q, parseInt(page), []]);
+// ── AI ────────────────────────────────────────────────────────────────────────
+app.post('/api/ai/generate', generateWithAI);
+
+// Health
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    ai: {
+      configured: !!process.env.AI_API_KEY,
+      provider: process.env.AI_PROVIDER || 'openai',
+      model: process.env.AI_MODEL || 'gpt-4o-mini'
+    },
+    github: { configured: !!process.env.GH_PAT }
+  });
 });
 
-// ── Detail ───────────────────────────────────────────────────────────────────
-app.get('/api/ext/:id/detail', async (req, res) => {
-  const { url = '' } = req.query;
-  await runMethod(req, res, 'getDetail', [url]);
-});
-
-// ── Video list ───────────────────────────────────────────────────────────────
-app.get('/api/ext/:id/videos', async (req, res) => {
-  const { url = '' } = req.query;
-  await runMethod(req, res, 'getVideoList', [url]);
-});
-
-// ── Page list (manga reader) ──────────────────────────────────────────────────
-app.get('/api/ext/:id/pages', async (req, res) => {
-  const { url = '' } = req.query;
-  await runMethod(req, res, 'getPageList', [url]);
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🗼 Watchtower Dev Center → http://0.0.0.0:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Watchtower Dev Center on port ${PORT}`));
